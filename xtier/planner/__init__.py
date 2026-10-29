@@ -32,7 +32,8 @@ def layer_config(layer_idx: int):
 
     from xtier.backend.method import LayerConfig
 
-    if get_flags().moe.in_speculative_scope:   # a speculative draft's layers
+    if getattr(get_flags().moe, 'in_speculative_scope', False):   # a speculative draft's layers
+        # (the flag exists only on newer SGLang; a release without it has no draft scope to detect)
         if not config.draft():
             return None
         return LayerConfig(layer_id=int(layer_idx), threads=config.threads(), cache_slots=config.draft_slots(),

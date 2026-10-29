@@ -78,20 +78,25 @@ class XTierMoEMethod(FusedMoEMethodBase):
     def create_weights(self, layer, num_experts, hidden_size, intermediate_size_per_partition, params_dtype,
                        **extra_weight_attrs):
         rc = layer.moe_runner_config
+        # SGLang main and the 0.5.x releases differ in these fields, so read them tolerantly: a field a release
+        # does not have is that release's default, never a reason to refuse the layer.
         unsupported = [what for what, bad in (
-            ('activation', rc.activation != 'silu'), ('non-gated experts', not rc.is_gated),
+            ('activation', getattr(rc, 'activation', 'silu') != 'silu'),
+            ('non-gated experts', not getattr(rc, 'is_gated', True)),
             ('expert bias', bool(extra_weight_attrs.get('with_bias'))),
-            ('router weight on input', rc.apply_router_weight_on_input),
-            ('fused shared experts', layer.num_fused_shared_experts > 0),
-            ('expert parallel MoE', layer.moe_ep_size > 1),
+            ('router weight on input', getattr(rc, 'apply_router_weight_on_input', False)),
+            ('fused shared experts', (getattr(layer, 'num_fused_shared_experts', 0) or 0) > 0),
+            ('expert parallel MoE', (getattr(layer, 'moe_ep_size', 1) or 1) > 1),
             ('params dtype', params_dtype != torch.bfloat16)) if bad]
         if unsupported:
             raise NotImplementedError(f'xtier: layer {self.cfg.layer_id}: unsupported {", ".join(unsupported)}')
         self.hidden, self.inter, self.experts = hidden_size, intermediate_size_per_partition, num_experts
-        self.swiglu_limit = float(rc.swiglu_limit or rc.gemm1_clamp_limit or 0.0)
-        # GPT-OSS SwiGLU (MiniMax M3: alpha 1.702, beta 1): gate * sigmoid(alpha * gate) * (up + beta)
-        self.swiglu_alpha = 1.0 if rc.gemm1_alpha is None else float(rc.gemm1_alpha)
-        self.swiglu_beta = 0.0 if rc.gemm1_beta is None else float(rc.gemm1_beta)
+        self.swiglu_limit = float(getattr(rc, 'swiglu_limit', None) or getattr(rc, 'gemm1_clamp_limit', None) or 0.0)
+        # GPT-OSS SwiGLU (MiniMax M3: alpha 1.702, beta 1): gate * sigmoid(alpha * gate) * (up + beta);
+        # gemm1_beta only exists on newer SGLang, and only MiniMax-M3 uses it.
+        alpha, beta = getattr(rc, 'gemm1_alpha', None), getattr(rc, 'gemm1_beta', None)
+        self.swiglu_alpha = 1.0 if alpha is None else float(alpha)
+        self.swiglu_beta = 0.0 if beta is None else float(beta)
         extra_weight_attrs['weight_loader'] = self._tracking_loader(layer, extra_weight_attrs['weight_loader'])
         with torch.device('cpu'):
             self.gpu_method.create_weights(layer, num_experts, hidden_size, intermediate_size_per_partition,
