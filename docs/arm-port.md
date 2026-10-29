@@ -205,3 +205,42 @@ with `--disable-cuda-graph` (then the token count changes from 10 to 5), so it i
 calling the prefill-shaped kernel for a <= 64-token decode, not graph capture. The kernels it names
 exist; the selection does not pick them on sm_121. Until that dispatch is patched (or a newer SGLang
 is used), the single-Spark best is the non-speculative configuration above.
+
+### Speculative decoding, measured
+
+Both algorithms the release allows for `DeepseekV4ForCausalLM` were tried on one GB10 with the same
+placement (`slots=40 cold=0.66`, target 87.56 GB + draft 6.09 GB, `XTIER_DRAFT=1`):
+
+| algorithm | flags | result |
+|---|---|---|
+| DSPARK (gamma 5, 6 draft tokens from `dspark_block_size`) | `--speculative-algorithm DSPARK` | target and draft load, then `tvm.error.InternalError: ... Decode (num_tokens <= 64) must go through sparse_mla_sm120_decode_dsv3_2 or sparse_mla_sm120_decode_dsv4; got num_tokens=10` |
+| EAGLE (topk 1) | `--speculative-algorithm EAGLE --speculative-eagle-topk 1` | dies earlier, in XTier's draft pack hooks: `http_server has no attribute _freeze_gc_after_server_warmup`, `openai has no attribute encoding_dsv41` - both are 0.5.21+ APIs |
+
+DSPARK was reproduced with every `--dsa-decode-backend` value (flashinfer_sparse_mla, flashmla_sparse,
+tilelang) and with `--disable-cuda-graph`, so the draft's <= 64-token decode is handed to the
+prefill-shaped sparse-MLA kernel by 0.5.17's dispatch on sm_121. That is the whole gap: XTier takes the
+draft's 3 MoE layers, the memory fits, only the attention kernel selection is wrong.
+
+The fix is a newer SGLang. Version map, from the wheel metadata:
+
+| sglang | `deepseek_v41_vit.py` | torch | sglang-kernel |
+|---|---|---|---|
+| 0.5.17 (works here) | no | 2.11.0 | 0.4.5 |
+| 0.5.18 / 0.5.19 / 0.5.20 | no | 2.13.0 | 0.4.6-0.4.7 |
+| 0.5.21 | **yes** | 2.13.0 | 0.4.7 |
+| 0.5.22 | yes | 2.14.1 (no cu130 aarch64 wheel) | >=0.4.9 |
+
+So 0.5.21 is the target: torch 2.13.0+cu130 (wheel exists on download.pytorch.org), flashinfer
+0.6.18, sglang-kernel 0.4.7. An isolated venv at `~/venvs/sglang-521` is built to that point; the
+resolver cannot finish on its own (`ResolutionImpossible`, PyPI's aarch64 torch is the CPU build), so
+the remaining steps are:
+
+```bash
+NEW=~/venvs/sglang-521
+$NEW/bin/pip install --no-deps pyzmq attrs transformers==5.19.0 tokenizers==0.23.2
+$NEW/bin/python -c "import sglang.srt.entrypoints.http_server"   # repeat: install whatever it names
+```
+
+Then launch with `PY=$NEW/bin/python` (the launcher honours `PY=`) and re-run the DSPARK and vision
+tests there. Note the working 0.5.17 stack must stay on torch 2.11 + sglang-kernel 0.4.5: 0.4.10 is
+built against torch 2.14 and fails with `undefined symbol: torch::Library::_def`.
