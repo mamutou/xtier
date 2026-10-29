@@ -23,6 +23,8 @@ the AVX2 kernels. The AVX512 kernel library disassembles to the same instruction
 `lkqmoe_create` compatibility entry point.
 
 Status (2026-10-29, AArch64): `tests/neon_check.py` passes on both ARM builds (RMS relative error 1.4e-7 … 2e-6 against a float64
-reference, both FP4 formats, 1 to 2048 tokens); `tools/isa_check.sh` shows no BF16 instruction in the baseline NEON library and
-none of the dispatch/mailbox/tables libraries. On one DGX Spark GB10 (20 cores) a DeepSeek V4.1 Flash 1017 layer runs at
-330 GFLOP/s decode (m=1) and 914 GFLOP/s prefill (m=2048) with the BFDOT build — 3.0x / 2.6x the baseline NEON build.
+reference, both FP4 formats, 1 to 2048 tokens), and `tests/real_layer_check.py` on layer 0 of DeepSeek-V4-Flash-0731 (MXFP4,
+H=4096, I=2048, 256 experts) agrees with its float64 reference to 9e-8 … 4.6e-6 (1 to 64 tokens); `tools/isa_check.sh` shows no
+BF16 instruction in the baseline NEON library and none in the dispatch/mailbox/tables libraries. On one DGX Spark GB10 (20 cores)
+that real layer runs at 356 GFLOP/s decode (m=1) and 889 GFLOP/s prefill (m=512) with the BFDOT build — 4.0x / 2.6x the
+baseline NEON build; a DeepSeek V4.1 Flash 1017-shaped layer (H=5120, I=2304) reaches 330 / 914 GFLOP/s.

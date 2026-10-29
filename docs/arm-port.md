@@ -9,6 +9,7 @@ CPU 专家引擎原来只有 x86 的 AVX512 BF16 和 AVX2/FMA 两套内核。这
 |---|---|
 | 内核 | `libxtier_engine_neonbf16.so`（Armv8.6-A BF16，`vbfdotq_f32`）与 `libxtier_engine_neon.so`（任何 Armv8-A，BF16 加宽 + FMA），`libxtier_engine.so` 运行时二选一 |
 | 数值 | 合成层对拍（float64 反量化参考，两种 FP4 格式 × 9 种 token 数 × 2 个 scale 量程 = 36 例）RMS 相对误差 1.4e-7…2e-6（真实量程），全部通过；两个 ARM 构建都通过 |
+| 真实检查点 | `~/models/DeepSeek-V4-Flash-0731` 第 0 层（H=4096、I=2048、256 专家、top-6、MXFP4）对 float64 参考：m=1…64 rms 9e-8…4.6e-6；两个 ARM 构建在真实权重上互相一致到 1e-7（decode） |
 | 速度（GB10，20 核，单层 H=5120 / I=2304 / top-6，64 专家，生产开关） | decode m=1 1.29 ms/层（330 GFLOP/s），prefill m=512 242 ms（899 GFLOP/s），m=2048 951 ms（914 GFLOP/s） |
 | 相对基线 NEON（无 BFDOT） | BFDOT 构建 decode 快 3.0×、prefill 快 2.6× |
 | 信箱（`libxtier_mailbox.so`） | 编译链接通过、`ctypes` 可加载（CUDA 依赖解析正常）；端到端握手需要真实检查点，本机没有，未跑 |
@@ -51,6 +52,9 @@ tools/isa_check.sh                           # 基线库不得含 BFDOT/BFMMLA�
 python tests/neon_check.py --threads 20      # 合成层：数值对拍 + 各 token 数耗时（不需要检查点）
 XTIER_ISA=neon python tests/neon_check.py --threads 20   # 强制基线 NEON 构建
 XTIER_DYNAMIC=2 XTIER_DOWN_BF16=1 python tests/neon_check.py --threads 20   # 生产开关
+python tests/real_layer_check.py --model ~/models/DeepSeek-V4-Flash-0731 --layer 0 --experts 64   # 真实检查点一层
+python tests/real_layer_check.py --model ... --save /tmp/a   # 另一个进程用 XTIER_ISA 跑同样的用例后：
+python tests/real_layer_check.py --model ... --compare /tmp/a /tmp/b      # 两个构建逐元素对比
 ```
 
 `tests/neon_check.py` 是给新 ISA 用的验收：两种 FP4 格式、9 种 token 数（1…2048，覆盖 decode / verify /
@@ -78,6 +82,30 @@ prefill 三条路径）、每组都用 numpy 在 float64 里反量化同一份�
 - m=4 比 m=2 慢（5.3 ms 对 1.7 ms）在这台机器上可复现，x86 上没观察过；分组/领取逻辑没改，属于待查项。
 - 与大核小核混排有关：GB10 是 10×X925 + 10×A725，静态均分行数会让 A725 拖住 barrier，这是 `XTIER_DYNAMIC`
   存在的理由；只用大核可以用 `XTIER_NODE_CORES` + `--threads 10` 对照。
+
+## 真实权重（DeepSeek-V4-Flash-0731，第 0 层，MXFP4）
+
+`tests/real_layer_check.py` 直接读检查点里的 `w1/w3/w2.weight` + `.scale`（int8 打包 + 每 32 个权重一个 UE8M0
+字节，正好是引擎的 MXFP4 布局），所以不经 GPU、不经 SGLang 就能在真实权重上验证。第 0 层是 H=4096、I=2048、
+256 个路由专家、top-6、`swiglu_limit=10`、无全局 scale（g=1）——顺带覆盖了 `run<4096,2048>` 这组特化模板。
+
+| token 数 | BFDOT 构建 | 基线 NEON | 对 float64 参考的 rms |
+|---:|---:|---:|---:|
+| 1 | 849 µs / 356 GF/s | 3416 µs / 88 GF/s | 9.3e-8 |
+| 2 | 1431 µs / 422 GF/s | 5970 µs / 101 GF/s | 9.6e-8 |
+| 4 | 2447 µs / 494 GF/s | 7542 µs / 160 GF/s | 4.9e-7 |
+| 8 | 5542 µs / 436 GF/s | 8748 µs / 276 GF/s | 9.4e-8 |
+| 64 | 27598 µs / 700 GF/s | 62799 µs / 308 GF/s | 4.6e-6 |
+| 512 | 174019 µs / 889 GF/s | 451136 µs / 343 GF/s | — |
+
+耗时是 `XTIER_DYNAMIC=2 XTIER_DOWN_BF16=1` 且 `--ref-tokens 0` 的那一次：带参考的跑法会让参考实现把权重挤出
+缓存，m=2/8 的耗时翻倍（8000 / 9217 µs），报价时用不带参考的那次。
+
+256 个专家（整层 4.3 GB 常驻）时 m=1 336 GF/s、m=512 814 GF/s，比 64 专家略低——每步触到的权重更散，和 x86 上
+的现象一致。
+
+两个 ARM 构建在真实权重上互相一致：m=1…4 逐元素最大差 1e-6、rms 1e-7；m=64/512 的差升到 1e-5…1.8e-5，是 bfdot
+成对求和与加宽 FMA 顺序不同、在真实权重的抵消下被放大，不是错（两者各自对 float64 参考的误差都在 1e-6 内）。
 
 ## 坑
 

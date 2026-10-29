@@ -6,7 +6,8 @@
   加宽 FMA 版本，`libxtier_engine.so` 按 HWCAP2 自动选（`XTIER_ISA=neon|neonbf16` 可强制）；信箱的自旋提示改 `yield`，
   单 NUMA / 无 SMT 的机器不再套用 x86 的 4 节点拓扑。新验收脚本 `tests/neon_check.py`（合成层对 float64 参考，不需要检查点）
   在两种 ARM 构建上都通过；`tools/isa_check.sh` 同时覆盖 AVX512 与 BFDOT。DGX Spark GB10 单层实测 decode 330 GFLOP/s
-  （m=1）、prefill 914 GFLOP/s（m=2048），基线 NEON 构建的 3.0× / 2.6×。详见[文档](arm-port.md)。
+  （m=1）、prefill 914 GFLOP/s（m=2048），基线 NEON 构建的 3.0× / 2.6×。新 `tests/real_layer_check.py` 直接读检查点跑一层
+  （DeepSeek-V4-Flash-0731 第 0 层 MXFP4：356 / 889 GFLOP/s，对 float64 参考 rms 9e-8…4.6e-6）。详见[文档](arm-port.md)。
 
 - 2026-10-28：decode 时可把一部分未命中的专家交给 GPU 代算（可选，`XTIER_DECODE_MISS_GPU`，默认关；启动台三张卡可选），
   给 CPU 比 PCIe 慢的机器用，结果与命中的专家相同。详见[文档](reports/2026-10-28-decode-miss-gpu.md)。
