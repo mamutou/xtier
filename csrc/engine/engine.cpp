@@ -7,9 +7,15 @@
 // other shapes use the runtime instantiation. Decode uses <=8 tokens; synchronous prefill groups up to 2048.
 // BF16 input; FP32 SiLU, intermediate, down projection, accumulation and output.
 // Kernels: AVX512 BF16 (+VBMI) when compiled for it, else AVX2/FMA (Zen2 and other hosts
-// without AVX512). CMake builds this file once per ISA (XTIER_IMPL_PREFIX set, one library each)
+// without AVX512), else NEON on AArch64 (baseline NEON; BFDOT when the build has BF16).
+// CMake builds this file once per ISA (XTIER_IMPL_PREFIX set, one library each)
 // and src/dispatch.cpp loads one at run time; a plain single build keeps the xtier_* names.
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#include <sys/auxv.h>
+#else
 #include <immintrin.h>
+#endif
 #include <pthread.h>
 #include <sched.h>
 #include <linux/futex.h>
@@ -36,10 +42,34 @@
 
 #if defined(__AVX512BF16__) && defined(__AVX512BW__)
 #define XTIER_AVX512 1
+#define XTIER_NEON 0
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+#define XTIER_AVX512 0
+#define XTIER_NEON 1
 #elif defined(__AVX2__) && defined(__FMA__)
 #define XTIER_AVX512 0
+#define XTIER_NEON 0
 #else
-#error "xtier needs AVX512 BF16/BW or AVX2+FMA (e.g. -march=x86-64-v3)"
+#error "xtier needs AVX512 BF16/BW, AVX2+FMA (e.g. -march=x86-64-v3) or AArch64 NEON"
+#endif
+// AArch64: BFDOT (Armv8.6 BF16) when the build enables it (-march=armv8.6-a+bf16, CMake's
+// libxtier_engine_neonbf16.so); otherwise the same kernels widen BF16 to FP32 and FMA.
+#if XTIER_NEON && (defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC) || defined(__ARM_FEATURE_BF16))
+#define XTIER_NEON_BF16 1
+#else
+#define XTIER_NEON_BF16 0
+#endif
+// Spin-wait hint of the worker loops (mailbox.cpp has the same two lines).
+#if XTIER_NEON
+#define XTIER_PAUSE() asm volatile("yield" ::: "memory")
+#else
+#define XTIER_PAUSE() _mm_pause()
+#endif
+#if XTIER_NEON
+// HWCAP2 bit 14: BF16 (as <asm/hwcap.h> defines it; repeated here so older headers still build).
+#ifndef XTIER_HWCAP2_BF16
+#define XTIER_HWCAP2_BF16 (1ul<<14)
+#endif
 #endif
 
 namespace {
@@ -137,6 +167,7 @@ inline __m512bh unpack(const uint8_t *p,const uint8_t *s, const std::array<uint1
 }
 #endif
 #endif  // XTIER_AVX512
+#if XTIER_AVX512
 // FP32 table per block scale, bit-for-bit the BF16 table widened: Down unpacks straight to
 // FP32 lanes in the same weight order as asfloat(unpack()), with fewer instructions.
 alignas(64) constexpr auto flut=[] {
@@ -144,7 +175,6 @@ alignas(64) constexpr auto flut=[] {
     for(int s=0;s<128;s++)for(int q=0;q<16;q++)t[s][q]=__builtin_bit_cast(float,uint32_t(lut[s][q])<<16);
     return t;
 }();
-#if XTIER_AVX512
 inline void unpack_f32(const uint8_t *p,const uint8_t *s,__m512 &lo,__m512 &hi, const std::array<float,16>* table=flut.data(), bool mx=false) {
     // Byte i holds weights 2i (low nibble) and 2i+1 (high nibble). Duplicate each byte into
     // two lanes, shift odd lanes by 4; vpermps reads only the low 4 index bits.
@@ -160,6 +190,62 @@ inline void asfloat(__m512bh a,__m512 &lo,__m512 &hi) {
     lo=_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm512_castsi512_si256(z)),16));
     hi=_mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(z,1)),16));
 }
+#elif XTIER_NEON
+// NEON: one 16-byte weight load covers 32 FP4 codes and two E4M3 block scales (s[0], s[1]; MXFP4 has
+// one scale per 32 weights, so s[0] serves both halves). Per scale the 16 BF16 values are held as
+// their 16 low bytes then 16 high bytes (nblut), which vqtbl2q_u8 serves in one instruction per byte
+// half; vzip1/2 interleave the halves back into BF16 lanes in weight order, little-endian like the
+// x86 paths. 14 instructions per 32 weights, no gather and no FP32 table: Down widens the same BF16
+// lanes with vshll_n_u16, exact like asfloat() on AVX512.
+alignas(64) constexpr auto nblut=[] {
+    std::array<std::array<uint8_t,32>,128> t{};
+    for(int s=0;s<128;s++)for(int q=0;q<16;q++){t[s][q]=uint8_t(lut[s][q]);t[s][16+q]=uint8_t(lut[s][q]>>8);}
+    return t;
+}();
+// 16 codes (one block, weights in order) and that block's 32-byte table -> BF16 weights 0..7 and 8..15.
+inline void unpack_block(uint8x16_t codes,const uint8_t *table,uint16x8_t &w0,uint16x8_t &w1) {
+    const uint8x16x2_t t={{vld1q_u8(table),vld1q_u8(table+16)}};
+    const uint8x16_t lo=vqtbl2q_u8(t,codes);
+    const uint8x16_t hi=vqtbl2q_u8(t,vaddq_u8(codes,vdupq_n_u8(16)));
+    w0=vreinterpretq_u16_u8(vzip1q_u8(lo,hi));w1=vreinterpretq_u16_u8(vzip2q_u8(lo,hi));
+}
+// Byte i holds weights 2i (low nibble) and 2i+1 (high nibble): 16 bytes -> codes 0..15 and 16..31.
+inline void codes_of32(const uint8_t *p,uint8x16_t &c0,uint8x16_t &c1) {
+    const uint8x16_t v=vld1q_u8(p),mask=vdupq_n_u8(15);
+    const uint8x16_t lo=vandq_u8(v,mask),hi=vshrq_n_u8(v,4);
+    c0=vzip1q_u8(lo,hi);c1=vzip2q_u8(lo,hi);
+}
+// 8 bytes -> the 16 codes of one block (the upper 8 bytes of the vector are zero and unused).
+inline uint8x16_t codes_of16(const uint8_t *p) {
+    const uint8x16_t v=vcombine_u8(vld1_u8(p),vdup_n_u8(0)),mask=vdupq_n_u8(15);
+    return vzip1q_u8(vandq_u8(v,mask),vshrq_n_u8(v,4));
+}
+// 32 packed weights at p (16 bytes, block scales s[0], s[1]) -> w[0..3] = weights 0..7, 8..15, 16..23, 24..31.
+inline void unpack32(const uint8_t *p,const uint8_t *s,uint16x8_t w[4],const std::array<uint8_t,32>* table=nblut.data(),
+                     bool mx=false) {
+    uint8x16_t c0,c1;codes_of32(p,c0,c1);
+    unpack_block(c0,table[s[0]].data(),w[0],w[1]);
+    unpack_block(c1,table[s[mx?0:1]].data(),w[2],w[3]);
+}
+// The first 16 of them: one E4M3 block, i.e. 16 weights that share s[0] (MXFP4's single scale covers both 16s).
+inline void unpack16(const uint8_t *p,const uint8_t *s,uint16x8_t w[2],const std::array<uint8_t,32>* table=nblut.data()) {
+    unpack_block(codes_of16(p),table[s[0]].data(),w[0],w[1]);
+}
+// BF16 -> FP32, exact: the value is the float's upper half.
+inline float32x4_t widen_lo(uint16x8_t v){return vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(v),16));}
+inline float32x4_t widen_hi(uint16x8_t v){return vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(v),16));}
+// acc += the eight BF16 products, FP32 accumulation: one BFDOT (Armv8.6 BF16), else two widening FMAs.
+inline float32x4_t dot8(float32x4_t acc,uint16x8_t w,uint16x8_t x) {
+#if XTIER_NEON_BF16
+    return vbfdotq_f32(acc,vreinterpretq_bf16_u16(w),vreinterpretq_bf16_u16(x));
+#else
+    acc=vfmaq_f32(acc,widen_lo(w),widen_lo(x));
+    return vfmaq_f32(acc,widen_hi(w),widen_hi(x));
+#endif
+}
+inline float hsum(float32x4_t v){return vaddvq_f32(v);}
+// BF16 rounding kept in FP32 (XTIER_DOWN_BF16 intermediate on the non-BFDOT build).
+inline float round_bf16(float v) {return __builtin_bit_cast(float,uint32_t(tobf(v))<<16);}
 #else
 // AVX2: 32 weights (16 bytes, two E4M3 scales s[0], s[1]) -> FP32 weights 0..7, 8..15, 16..23,
 // 24..31 in w[0..3], the BF16 table values widened. Per scale, two vpshufb pick the low and high
@@ -265,8 +351,24 @@ Topology detect_topology() {
     }
     if(!t.nodes&&!only.empty())throw std::runtime_error("XTIER_NODES: none of the listed NUMA nodes has CPUs");
     if(!t.nodes) {
-        t=Topology{};t.nodes=4;
-        for(int v=0;v<4;v++){t.memory[v]=v;for(int j=0;j<16;j++){t.cores[v].push_back(v*16+j);t.siblings[v].push_back(64+v*16+j);}}
+        // No NUMA sysfs (single-node kernel, some ARM hosts): one worker node over the online CPUs,
+        // no SMT siblings. x86 hosts with /sys/devices/system/node never get here.
+        std::string online_cpus;
+        std::vector<int> cpus;
+        if(read_text("/sys/devices/system/cpu/online",online_cpus))cpus=parse_cpulist(online_cpus);
+        if(cpus.empty()) {
+            int n=int(std::thread::hardware_concurrency());
+            for(int c=0;c<std::max(n,1);c++)cpus.push_back(c);
+        }
+#if !XTIER_NEON
+        if(cpus.size()==64) {   // the original fixed 4-node x86 host
+            t=Topology{};t.nodes=4;
+            for(int v=0;v<4;v++){t.memory[v]=v;for(int j=0;j<16;j++){t.cores[v].push_back(v*16+j);t.siblings[v].push_back(64+v*16+j);}}
+        } else
+#endif
+        {
+            t=Topology{};t.nodes=1;t.memory[0]=0;t.cores[0]=cpus;
+        }
     }
     int split=1;
     if(const char *s=std::getenv("XTIER_SPLIT_NODES"))split=std::stoi(s);
@@ -329,7 +431,9 @@ Bytes alloc(size_t n,int node) {
     // Override an inherited process-wide interleave policy for these weights only.
     // Preferred, not bound: under memory pressure on this node (e.g. page cache from model
     // loading) pages spill to another node instead of invoking the OOM killer.
-    if(syscall(SYS_mbind,p,bytes,MPOL_PREFERRED,&mask,sizeof(mask)*8,0))
+    // Single-node hosts (most AArch64 boxes, CONFIG_NUMA off) have nothing to bind to: a failing
+    // mbind there is not an error, the mapping is already on the only node.
+    if(syscall(SYS_mbind,p,bytes,MPOL_PREFERRED,&mask,sizeof(mask)*8,0) && topology().nodes>1)
         throw std::runtime_error("Binding weight shard to its NUMA node failed");
 #if XTIER_HUGEPAGES
     // Advisory only: THP "madvise" policy; failure keeps 4KiB pages and identical math.
@@ -405,7 +509,7 @@ public:
                 while(!quit.load(std::memory_order_relaxed)) {
                     uint32_t e=epoch.load(std::memory_order_acquire);
                     if(e==seen) {
-                        _mm_pause();
+                        XTIER_PAUSE();
                         if(++spins>=spin_budget.load(std::memory_order_relaxed)) {
                             if(epoch.load(std::memory_order_acquire)==seen && !quit.load())
                                 syscall(SYS_futex,&epoch,FUTEX_WAIT_PRIVATE,seen,nullptr,nullptr,0);
@@ -425,7 +529,7 @@ public:
                     if(lane==0) {
                         // Gather this node's workers on local cache lines; the caller
                         // then polls one flag per node instead of one per worker.
-                        for(int j=i+nodes;j<n;j+=nodes)while(done[j].epoch.load(std::memory_order_acquire)!=e)_mm_pause();
+                        for(int j=i+nodes;j<n;j+=nodes)while(done[j].epoch.load(std::memory_order_acquire)!=e)XTIER_PAUSE();
                         node_done[node].epoch.store(e,std::memory_order_release);
                         continue;
                     }
@@ -464,9 +568,9 @@ public:
         epoch.store(e,std::memory_order_release);
         syscall(SYS_futex,&epoch,FUTEX_WAKE_PRIVATE,threads,nullptr,nullptr,0);
 #if XTIER_NODE_BARRIER
-        for(int node=0;node<nodes;node++)while(node_done[node].epoch.load(std::memory_order_acquire)!=e)_mm_pause();
+        for(int node=0;node<nodes;node++)while(node_done[node].epoch.load(std::memory_order_acquire)!=e)XTIER_PAUSE();
 #else
-        for(int i=0;i<threads;i++)while(done[i].epoch.load(std::memory_order_acquire)!=e)_mm_pause();
+        for(int i=0;i<threads;i++)while(done[i].epoch.load(std::memory_order_acquire)!=e)XTIER_PAUSE();
 #endif
 #if XTIER_LANE_TIMING
         int64_t seen=now_ns();
@@ -557,6 +661,10 @@ template<bool MX> class Plan: public PlanBase {
     const std::array<float,16>* fp_table=flut.data();
     __m512bh unpack(const uint8_t* p,const uint8_t* s) const {if constexpr(MX)return ::unpack(p,s,bf_table,true);else return ::unpack(p,s);}
     void unpack_f32(const uint8_t* p,const uint8_t* s,__m512& a,__m512& b) const {if constexpr(MX)::unpack_f32(p,s,a,b,fp_table,true);else ::unpack_f32(p,s,a,b);}
+#elif XTIER_NEON
+    const std::array<uint8_t,32>* byte_table=nblut.data();
+    void unpack32(const uint8_t* p,const uint8_t* s,uint16x8_t w[4]) const {if constexpr(MX)::unpack32(p,s,w,byte_table,true);else ::unpack32(p,s,w);}
+    void unpack16(const uint8_t* p,const uint8_t* s,uint16x8_t w[2]) const {::unpack16(p,s,w,byte_table);}
 #else
     const std::array<uint8_t,32>* byte_table=blut.data();
     void unpack32(const uint8_t* p,const uint8_t* s,__m256 w[4]) const {if constexpr(MX)::unpack32(p,s,w,byte_table,true);else ::unpack32(p,s,w);}
@@ -757,7 +865,7 @@ template<bool MX> class Plan: public PlanBase {
             }
         }
     }
-#else
+#elif !XTIER_NEON
     // AVX2 (16 YMM registers): FP32 weights from the table, BF16 inputs widened, FMA into
     // FP32. Products are exact (<=6 significant weight bits x 8 input bits), so only the
     // summation order differs from the AVX512 BF16 dot products. R rows x MT tokens
@@ -870,6 +978,115 @@ template<bool MX> class Plan: public PlanBase {
         else if constexpr(M<=3)down_core<4,M,1,HC,IC>(node,g,begin,end,out,0);
         else if constexpr(M==4)down_core<2,4,1,HC,IC>(node,g,begin,end,out,0);
         else down_core<1,M,1,HC,IC>(node,g,begin,end,out,0);
+    }
+#elif XTIER_NEON
+    // AArch64 NEON (32 registers of 128 bits, no SMT siblings on the hosts this targets): the same
+    // row/token blocking as the AVX2 path, but every BF16x8 group is dotted with BFDOT (Armv8.6) or
+    // with two widening FMAs. Down keeps the AVX512 kernel's FP32 intermediate: the unpacked BF16
+    // weights widen exactly to FP32 and FMA into FP32 accumulators in weight order, so only the
+    // summation order differs from the x86 builds.
+    template<int M,int HC,int IC> void gate_rows(int node,int g,int begin,int end) {
+        const int H=HC?HC:hidden,I=IC?IC:inter,IN=I/nodes;
+        float *__restrict const out_mid=mid;const float limit=swiglu_limit;
+        const float alpha=swiglu_alpha,beta=swiglu_beta;const bool oai=alpha!=1.f||beta!=0.f;
+        const float scale_gate=globals13[2*group_expert(g)],scale_up=globals13[2*group_expert(g)+1];
+        const auto &s=shards[node];const auto &group=groups[g];const size_t slot=size_t(group.slot);
+        const uint16_t *xs[M];for(int t=0;t<M;t++)xs[t]=input+size_t(group.token[t])*H;
+        // Two rows per iteration up to M=4 (2*R*M accumulators stay in registers), one row beyond.
+        constexpr int R=M<=4?2:1;
+        for(int r=begin;r<end;r+=R) {
+            float32x4_t ag[R][M],au[R][M];
+            for(int j=0;j<R;j++)for(int t=0;t<M;t++){ag[j][t]=vdupq_n_f32(0.f);au[j][t]=vdupq_n_f32(0.f);}
+            for(int c=0;c<H;c+=32) {
+                for(int j=0;j<R;j++) {
+                    const size_t base=slot*IN+r+j;
+                    uint16x8_t wg[4],wu[4];
+                    unpack32(s.gate.get()+base*(H/2)+c/2,s.sg.get()+base*(H>>scale_shift)+(c>>scale_shift),wg);
+                    unpack32(s.up.get()+base*(H/2)+c/2,s.su.get()+base*(H>>scale_shift)+(c>>scale_shift),wu);
+                    for(int t=0;t<M;t++) {
+                        const uint16_t *xp=xs[t]+c;
+                        for(int q=0;q<4;q++) {
+                            const uint16x8_t x=vld1q_u16(xp+8*q);
+                            ag[j][t]=dot8(ag[j][t],wg[q],x);au[j][t]=dot8(au[j][t],wu[q],x);
+                        }
+                    }
+                }
+            }
+            for(int j=0;j<R;j++)for(int t=0;t<M;t++) {
+                float gate=hsum(ag[j][t])*scale_gate;
+                float up=hsum(au[j][t])*scale_up;
+                if(limit>0.f) {
+                    // Clamped SwiGLU (DeepSeek V4 Expert): up to [-L,L], gate to (-inf,L].
+                    up=std::min(std::max(up,-limit),limit);
+                    gate=std::min(gate,limit);
+                }
+                float value=oai?(gate/(1.f+std::exp(-alpha*gate)))*(up+beta):(gate/(1.f+std::exp(-gate)))*up;
+                const size_t at=(size_t(group.row)+t)*I+node*IN+r+j;
+                if(down_bf16)reinterpret_cast<uint16_t*>(out_mid)[at]=tobf(value);
+                else out_mid[at]=value;
+            }
+        }
+    }
+
+    template<int M,int HC,int IC> void down_rows_bf16(int node,int g,int begin,int end,float *destination) {
+        const int H=HC?HC:hidden,I=IC?IC:inter,HN=H/nodes;
+        const auto &s=shards[node];const auto &group=groups[g];const int e=group.expert;const size_t slot=size_t(group.slot);
+        const uint16_t *__restrict const in_mid=reinterpret_cast<const uint16_t*>(mid);const float scale=globals2[e];
+        float *__restrict const out=destination?destination:output;
+        float route[M];int token[M];for(int t=0;t<M;t++){route[t]=group.route[t];token[t]=group.token[t];}
+        constexpr int R=M<=4?2:1;
+        for(int r=begin;r<end;r+=R) {
+            float32x4_t acc[R][M];for(int j=0;j<R;j++)for(int t=0;t<M;t++)acc[j][t]=vdupq_n_f32(0.f);
+            for(int c=0;c<I;c+=32) {
+                for(int j=0;j<R;j++) {
+                    const size_t base=slot*HN+r+j;
+                    uint16x8_t w[4];
+                    unpack32(s.down.get()+base*(I/2)+c/2,s.sd.get()+base*(I>>scale_shift)+(c>>scale_shift),w);
+                    for(int t=0;t<M;t++) {
+                        const uint16_t *xp=in_mid+(size_t(group.row)+t)*I+c;
+                        for(int q=0;q<4;q++)acc[j][t]=dot8(acc[j][t],w[q],vld1q_u16(xp+8*q));
+                    }
+                }
+            }
+            for(int j=0;j<R;j++)for(int t=0;t<M;t++) {
+                const float val=hsum(acc[j][t])*scale;
+                out[size_t(token[t])*H+node*HN+r+j]+=val*route[t];
+            }
+        }
+    }
+
+    template<int M,int HC,int IC> void down_rows(int node,int g,int begin,int end,float *destination=nullptr) {
+        if(down_bf16){down_rows_bf16<M,HC,IC>(node,g,begin,end,destination);return;}
+        const int H=HC?HC:hidden,I=IC?IC:inter,HN=H/nodes;
+        const auto &s=shards[node];const auto &group=groups[g];const int e=group.expert;const size_t slot=size_t(group.slot);
+        const float *__restrict const in_mid=mid;const float scale=globals2[e];
+        float *__restrict const out=destination?destination:output;
+        float route[M];int token[M];for(int t=0;t<M;t++){route[t]=group.route[t];token[t]=group.token[t];}
+        // 16 weights per step = one E4M3 block: two BF16x8 groups widen to four FP32x4 vectors.
+        // Row steps divide the four-row split boundaries the callers hand down.
+        constexpr int R=M<=2?4:(M<=4?2:1);
+        for(int r=begin;r<end;r+=R) {
+            float32x4_t acc[R][M];for(int j=0;j<R;j++)for(int t=0;t<M;t++)acc[j][t]=vdupq_n_f32(0.f);
+            for(int c=0;c<I;c+=16) {
+                for(int j=0;j<R;j++) {
+                    const size_t base=slot*HN+r+j;
+                    uint16x8_t w[2];
+                    unpack16(s.down.get()+base*(I/2)+c/2,s.sd.get()+base*(I>>scale_shift)+(c>>scale_shift),w);
+                    const float32x4_t w0=widen_lo(w[0]),w1=widen_hi(w[0]),w2=widen_lo(w[1]),w3=widen_hi(w[1]);
+                    for(int t=0;t<M;t++) {
+                        const float *row=in_mid+(size_t(group.row)+t)*I+c;
+                        acc[j][t]=vfmaq_f32(acc[j][t],w0,vld1q_f32(row));
+                        acc[j][t]=vfmaq_f32(acc[j][t],w1,vld1q_f32(row+4));
+                        acc[j][t]=vfmaq_f32(acc[j][t],w2,vld1q_f32(row+8));
+                        acc[j][t]=vfmaq_f32(acc[j][t],w3,vld1q_f32(row+12));
+                    }
+                }
+            }
+            for(int j=0;j<R;j++)for(int t=0;t<M;t++) {
+                const float val=hsum(acc[j][t])*scale;
+                out[size_t(token[t])*H+node*HN+r+j]+=val*route[t];
+            }
+        }
     }
 #endif
 
@@ -1015,6 +1232,15 @@ template<bool MX> class Plan: public PlanBase {
             // Compact MXFP4 scale rows need not be a cache-line multiple.
             if(o<n){alignas(64) uint8_t tail[64]{};std::memcpy(tail,p+o,n-o);acc=_mm512_xor_si512(acc,_mm512_load_si512(tail));}
         };
+#elif XTIER_NEON
+        uint8x16_t acc[4]={vdupq_n_u8(0),vdupq_n_u8(0),vdupq_n_u8(0),vdupq_n_u8(0)};
+        auto stream=[&](const uint8_t *p,size_t n){
+            size_t o=0;
+            for(;n-o>=64;o+=64)for(int q=0;q<4;q++)acc[q]=veorq_u8(acc[q],vld1q_u8(p+o+16*q));
+            for(;n-o>=16;o+=16)acc[1]=veorq_u8(acc[1],vld1q_u8(p+o));
+            // Compact MXFP4 scale rows need not be a vector multiple.
+            if(o<n){alignas(16) uint8_t tail[16]{};std::memcpy(tail,p+o,n-o);acc[2]=veorq_u8(acc[2],vld1q_u8(tail));}
+        };
 #else
         __m256i acc=_mm256_setzero_si256();
         auto stream=[&](const uint8_t *p,size_t n){
@@ -1037,6 +1263,10 @@ template<bool MX> class Plan: public PlanBase {
         }
 #if XTIER_AVX512
         static volatile long long sink;sink=_mm512_reduce_add_epi64(acc);
+#elif XTIER_NEON
+        static volatile long long sink;
+        sink=static_cast<long long>(vgetq_lane_u64(vreinterpretq_u64_u8(veorq_u8(veorq_u8(acc[0],acc[1]),veorq_u8(acc[2],acc[3]))),0));
+        (void)sink;
 #else
         static volatile long long sink;sink=_mm256_extract_epi64(acc,0)+_mm256_extract_epi64(acc,3);
 #endif
@@ -1379,7 +1609,15 @@ struct Handle {std::shared_ptr<PlanBase> plan;};
 #endif
 extern "C" {
 const char *XTIER_API(xtier_last_error)(){return last_error.c_str();}
-const char *XTIER_API(xtier_isa)(){return XTIER_AVX512?"avx512":"avx2";}
+const char *XTIER_API(xtier_isa)(){
+#if XTIER_AVX512
+    return "avx512";
+#elif XTIER_NEON
+    return XTIER_NEON_BF16?"neon-bf16":"neon";
+#else
+    return "avx2";
+#endif
+}
 void *XTIER_API(xtier_create3)(int hidden,int inter,int experts,int threads,float swiglu_limit,int scale_format,
                     const uint8_t *w13,const uint8_t *w2,const uint8_t *s13,const uint8_t *s2,
                     const float *g13,const float *g2) {
@@ -1387,6 +1625,12 @@ void *XTIER_API(xtier_create3)(int hidden,int inter,int experts,int threads,floa
 #if XTIER_AVX512
         if(!__builtin_cpu_supports("avx512bf16")||!__builtin_cpu_supports("avx512bw"))
             throw std::runtime_error("AVX512 BF16/BW required");
+#elif XTIER_NEON
+#if XTIER_NEON_BF16
+        // NEON itself is mandatory on AArch64; the BFDOT build is not.
+        if(!(getauxval(AT_HWCAP2)&XTIER_HWCAP2_BF16))
+            throw std::runtime_error("BF16 (Armv8.6 BFDOT) is required by this kernel build; XTIER_ISA=neon selects the generic one");
+#endif
 #else
         if(!__builtin_cpu_supports("avx2")||!__builtin_cpu_supports("fma"))
             throw std::runtime_error("AVX2/FMA required");
@@ -1406,6 +1650,12 @@ void *XTIER_API(xtier_create4)(int hidden,int inter,int experts,int slots,int th
 #if XTIER_AVX512
         if(!__builtin_cpu_supports("avx512bf16")||!__builtin_cpu_supports("avx512bw"))
             throw std::runtime_error("AVX512 BF16/BW required");
+#elif XTIER_NEON
+#if XTIER_NEON_BF16
+        // NEON itself is mandatory on AArch64; the BFDOT build is not.
+        if(!(getauxval(AT_HWCAP2)&XTIER_HWCAP2_BF16))
+            throw std::runtime_error("BF16 (Armv8.6 BFDOT) is required by this kernel build; XTIER_ISA=neon selects the generic one");
+#endif
 #else
         if(!__builtin_cpu_supports("avx2")||!__builtin_cpu_supports("fma"))
             throw std::runtime_error("AVX2/FMA required");

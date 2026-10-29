@@ -1,17 +1,23 @@
 // Ported from lkqmoe 0.5.6 (commit 93edcc1) by tools/port_engine.py: identifiers, strings and comments
 // renamed only, so the kernels compile to the same code.
-// One libxtier.so for hosts with and without AVX512: src/xtier.cpp is built twice, into
-// libxtier_avx512.so (AVX512 BF16/VBMI) and libxtier_avx2.so (AVX2/FMA), with prefixed API names
-// (avx512_ / avx2_). This file, compiled for baseline x86-64, exports the public xtier_* API and
-// forwards every call to the build chosen on first use, loaded with dlopen from this library's own
-// directory: AVX512 when the CPU has every extension that build was compiled for, else AVX2.
-// XTIER_ISA=avx512|avx2 forces one; an unsupported choice makes every create fail with the reason
-// in xtier_last_error. Only the chosen library is ever loaded, so no code of the other runs.
+// One libxtier.so for hosts with and without AVX512: src/xtier.cpp (or on AArch64 with and without
+// BF16) is built once per ISA, into libxtier_avx512.so (AVX512 BF16/VBMI), libxtier_avx2.so
+// (AVX2/FMA), libxtier_neonbf16.so (AArch64 NEON + BFDOT, Armv8.6) and libxtier_neon.so (baseline
+// AArch64 NEON), with prefixed API names (avx512_ / avx2_ / neonbf16_ / neon_). This file, compiled
+// for the baseline, exports the public xtier_* API and forwards every call to the build chosen on
+// first use, loaded with dlopen from this library's own directory: AVX512 when the CPU has every
+// extension that build was compiled for, else AVX2; on AArch64 the BFDOT build when the kernel
+// reports BF16 (HWCAP2), else baseline NEON.
+// XTIER_ISA=avx512|avx2|neon|neonbf16 forces one; an unsupported choice makes every create fail with
+// the reason in xtier_last_error. Only the chosen library is ever loaded, so no code of the other runs.
 #include "xtier_engine.h"
 #include <dlfcn.h>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <sys/auxv.h>
+#endif
 
 namespace {
 struct Impl {
@@ -44,16 +50,25 @@ struct Impl {
 Impl impl_storage;
 std::string error;
 
-// Must match the compile flags of the two builds (CMakeLists.txt XTIER_AVX512_FLAGS /
-// XTIER_AVX2_FLAGS).
+// Must match the compile flags of the kernel builds (CMakeLists.txt XTIER_AVX512_FLAGS /
+// XTIER_AVX2_FLAGS / XTIER_NEON_FLAGS / XTIER_NEONBF16_FLAGS).
+#if defined(__aarch64__) || defined(_M_ARM64)
+// HWCAP2 bit 14: BF16 (as <asm/hwcap.h> defines it; repeated here so older headers still build).
+#ifndef XTIER_HWCAP2_BF16
+#define XTIER_HWCAP2_BF16 (1ul<<14)
+#endif
+bool has_bf16() {return (getauxval(AT_HWCAP2)&XTIER_HWCAP2_BF16)!=0;}
+#else
 bool has_avx512() {
     return __builtin_cpu_supports("x86-64-v4")&&__builtin_cpu_supports("avx512bf16")&&__builtin_cpu_supports("avx512vbmi");
 }
 bool has_avx2() {return __builtin_cpu_supports("x86-64-v3");}
+#endif
+void probe() {}   // an address inside this library, for own_directory()
 
 std::string own_directory() {
     Dl_info info{};
-    if(!dladdr(reinterpret_cast<void*>(&has_avx2),&info)||!info.dli_fname)return ".";
+    if(!dladdr(reinterpret_cast<void*>(&probe),&info)||!info.dli_fname)return ".";
     std::string path=info.dli_fname;
     size_t slash=path.rfind('/');
     return slash==std::string::npos?".":path.substr(0,slash);
@@ -88,20 +103,45 @@ const Impl *load(const char *isa) {
 }
 
 const Impl *choose() {
-    __builtin_cpu_init();
     const char *env=std::getenv("XTIER_ISA");
     std::string want=env?env:"";
     const char *isa=nullptr;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const bool bf16=has_bf16();
+#else
+    __builtin_cpu_init();
+    const bool avx512=has_avx512(),avx2=has_avx2();
+#endif
     if(want==""||want=="auto") {
-        isa=has_avx512()?"avx512":has_avx2()?"avx2":nullptr;
+#if defined(__aarch64__) || defined(_M_ARM64)
+        isa=bf16?"neonbf16":"neon";
+#else
+        isa=avx512?"avx512":avx2?"avx2":nullptr;
         if(!isa)error="xtier needs AVX2/FMA (x86-64-v3) or AVX512 BF16/VBMI";
+#endif
     } else if(want=="avx512") {
-        if(has_avx512())isa="avx512";
+#if defined(__aarch64__) || defined(_M_ARM64)
+        error="XTIER_ISA=avx512 on an AArch64 host: use auto, neon or neonbf16";
+#else
+        if(avx512)isa="avx512";
         else error="XTIER_ISA=avx512 but this CPU lacks AVX512 F/BW/CD/DQ/VL, BF16 or VBMI";
+#endif
     } else if(want=="avx2") {
-        if(has_avx2())isa="avx2";
+#if defined(__aarch64__) || defined(_M_ARM64)
+        error="XTIER_ISA=avx2 on an AArch64 host: use auto, neon or neonbf16";
+#else
+        if(avx2)isa="avx2";
         else error="XTIER_ISA=avx2 but this CPU lacks AVX2/FMA (x86-64-v3)";
-    } else error="XTIER_ISA must be auto, avx512 or avx2";
+#endif
+    } else if(want=="neon"||want=="neonbf16") {
+#if defined(__aarch64__) || defined(_M_ARM64)
+        if(want=="neon")isa="neon";
+        else if(bf16)isa="neonbf16";
+        else error="XTIER_ISA=neonbf16 but this CPU lacks BF16 (Armv8.6), so BFDOT cannot run";
+#else
+        error="XTIER_ISA="+want+" on an x86-64 host: use auto, avx512 or avx2";
+#endif
+    } else error="XTIER_ISA must be auto, avx512, avx2, neon or neonbf16";
     const Impl *chosen=isa?load(isa):nullptr;
     if(chosen)std::fprintf(stderr,"[xtier] CPU kernels: %s%s\n",chosen->name,want==""||want=="auto"?"":" (XTIER_ISA)");
     else std::fprintf(stderr,"[xtier] %s\n",error.c_str());

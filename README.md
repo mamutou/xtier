@@ -54,6 +54,11 @@ XTIER=1 XTIER_THREADS=112 XTIER_MAIN_CPUS=auto XTIER_CACHE_SLOTS=155 \
 
 开关见 [xtier/config.py](xtier/config.py)；按模型和硬件的完整启动参数见 [configs/](configs/)，也可以用下面的启动台。
 
+**AArch64**（DGX Spark / Grace / GH200 / Graviton 等）：`tools/build_engine.sh` 在 aarch64 上构建两套 NEON 内核
+（`neonbf16` 用 Armv8.6 BF16 点积、`neon` 是任意 ARMv8-A 的加宽 FMA 版本），运行时按 CPU 的 BF16 能力自动选，
+`XTIER_THREADS` 取物理核数（ARM 没有 SMT，Spark 的 20 核就是 20）。移植、内核设计和 GB10 实测见
+[docs/arm-port.md](docs/arm-port.md)；验收用 `tests/neon_check.py`（不需要检查点）和 `tools/isa_check.sh`。
+
 快速加载（可选，`XTIER_FAST_LOAD=1`；默认关，即 SGLang 原来的加载方式）：专家直接从模型文件（开冷专家时从冷存储）读进
 CPU 引擎，全部读完、检查完才报在线，DeepSeek V4.1 Flash 1017 启动 472 → 186 s（[报告](docs/reports/2026-10-27-fast-load.md)）。
 

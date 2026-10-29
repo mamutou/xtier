@@ -2,6 +2,12 @@
 
 按日期倒序，README 只列最近 5 条。
 
+- 2026-10-29：CPU 专家引擎移植到 AArch64（NEON）：`neonbf16` 构建用 Armv8.6 BF16 点积、`neon` 构建是任意 ARMv8-A 的
+  加宽 FMA 版本，`libxtier_engine.so` 按 HWCAP2 自动选（`XTIER_ISA=neon|neonbf16` 可强制）；信箱的自旋提示改 `yield`，
+  单 NUMA / 无 SMT 的机器不再套用 x86 的 4 节点拓扑。新验收脚本 `tests/neon_check.py`（合成层对 float64 参考，不需要检查点）
+  在两种 ARM 构建上都通过；`tools/isa_check.sh` 同时覆盖 AVX512 与 BFDOT。DGX Spark GB10 单层实测 decode 330 GFLOP/s
+  （m=1）、prefill 914 GFLOP/s（m=2048），基线 NEON 构建的 3.0× / 2.6×。详见[文档](arm-port.md)。
+
 - 2026-10-28：decode 时可把一部分未命中的专家交给 GPU 代算（可选，`XTIER_DECODE_MISS_GPU`，默认关；启动台三张卡可选），
   给 CPU 比 PCIe 慢的机器用，结果与命中的专家相同。详见[文档](reports/2026-10-28-decode-miss-gpu.md)。
 - 2026-10-27（下午）：快速加载（可选，`XTIER_FAST_LOAD=1`，默认关）：专家直接从模型文件或冷存储读进 CPU 引擎，仍是全部装好

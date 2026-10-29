@@ -65,7 +65,7 @@ def engine() -> C.CDLL:
 
 
 def isa() -> str:
-    """Kernel build in use: "avx512", "avx2", or "none" (unsupported CPU / XTIER_ISA)."""
+    """Kernel build in use: "avx512", "avx2", "neon-bf16", "neon", or "none" (unsupported CPU / XTIER_ISA)."""
     return engine().xtier_isa().decode()
 
 

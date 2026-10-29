@@ -8,13 +8,15 @@
 extern "C" {
 #endif
 
-// Linux x86 with AVX512 BF16/VBMI or AVX2/FMA: one library holds both kernel builds and picks
-// one per process on first use (XTIER_ISA=avx512|avx2 forces it; see xtier_isa). Worker nodes come from sysfs: every NUMA
+// Linux x86-64 (AVX512 BF16/VBMI or AVX2/FMA) or AArch64 (NEON, with the BF16 dot product when the
+// CPU and the build have it): one library holds every kernel build and picks one per process on first
+// use (XTIER_ISA=avx512|avx2|neon|neonbf16 forces it; see xtier_isa). Worker nodes come from sysfs: every NUMA
 // node with CPUs (any NPS setting, one or two sockets); each expert's Gate/Up and Down rows
 // are split evenly over them, so H and I must be multiples of 16 * nodes. Workers bind to the
-// node's physical cores first, then their SMT siblings (XTIER_NODE_CORES). Without sysfs:
-// the original fixed host (4 nodes, CPUs 16v..16v+15, siblings 64+16v..). Outputs do not
-// depend on the node count (same operations in the same order for every row).
+// node's physical cores first, then their SMT siblings (XTIER_NODE_CORES); a host without SMT
+// siblings (most AArch64) gets its physical cores only. Without sysfs: one worker node over the
+// online CPUs (or, on x86, the original fixed host: 4 nodes, CPUs 16v..16v+15, siblings 64+16v..).
+// Outputs do not depend on the node count (same operations in the same order for every row).
 // One generic kernel: hidden size H and expert intermediate size I are per plan
 // (multiples of 64); NVFP4 E2M1 weights, low nibble first, E4M3 block scales per 16.
 // All arrays contiguous, row-major:

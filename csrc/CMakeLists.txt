@@ -6,16 +6,28 @@ set(XTIER_PREFILL_MICRO_TOKENS "8" CACHE STRING "CPU expert microbatch size: 4 o
 if(NOT XTIER_PREFILL_MICRO_TOKENS MATCHES "^(4|8)$")
   message(FATAL_ERROR "XTIER_PREFILL_MICRO_TOKENS must be 4 or 8")
 endif()
-# engine/engine.cpp is built once per ISA into its own library (libxtier_engine_avx512.so, libxtier_engine_avx2.so);
-# libxtier_engine.so (engine/dispatch.cpp, baseline x86-64) exports the API and dlopens the build picked at run time
-# from its own directory. Separate libraries matter: inline functions both builds use (e.g. std::to_string) would
-# otherwise be merged into one copy compiled for one of the ISAs. Keep the flags in step with the CPU checks in
-# engine/dispatch.cpp.
+# engine/engine.cpp is built once per ISA into its own library (libxtier_engine_avx512.so and
+# libxtier_engine_avx2.so on x86-64, libxtier_engine_neonbf16.so and libxtier_engine_neon.so on
+# AArch64); libxtier_engine.so (engine/dispatch.cpp, baseline) exports the API and dlopens the build
+# picked at run time from its own directory. Separate libraries matter: inline functions both builds
+# use (e.g. std::to_string) would otherwise be merged into one copy compiled for one of the ISAs. Keep
+# the flags in step with the CPU checks in engine/dispatch.cpp.
 set(XTIER_AVX512_FLAGS "-march=x86-64-v4;-mavx512bf16;-mavx512vbmi;-mtune=znver4" CACHE STRING "AVX512 kernel build flags")
 set(XTIER_AVX2_FLAGS "-march=x86-64-v3;-mtune=znver2" CACHE STRING "AVX2 kernel build flags")
+# AArch64: baseline NEON runs on any ARMv8-A (Graviton2, Raspberry Pi 4/5, Neoverse N1); the BFDOT
+# build needs Armv8.6-A BF16 (DGX Spark GB10, Grace/GH200, Neoverse V2, Cortex-X9xx, Apple M-series
+# under Linux VMs). dispatch.cpp picks the BFDOT build when HWCAP2 reports BF16.
+# Tune for the local core with -DXTIER_NEONBF16_FLAGS="-march=armv8.6-a+bf16+i8mm+dotprod -mcpu=native".
+set(XTIER_NEON_FLAGS "-march=armv8-a+simd" CACHE STRING "AArch64 baseline NEON kernel build flags")
+set(XTIER_NEONBF16_FLAGS "-march=armv8.6-a+bf16+i8mm+dotprod" CACHE STRING "AArch64 NEON+BFDOT kernel build flags")
 # Down rows per microkernel iteration in the AVX512 build: 1 (one-row, the release build since lkqmoe 0.5.5) or 4.
 set(XTIER_AVX512_DOWN_R4 "1" CACHE STRING "Down microkernel rows of the AVX512 build: 1, 2 or 4")
-foreach(isa avx512 avx2)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)")
+  set(XTIER_ISAS neonbf16 neon)
+else()
+  set(XTIER_ISAS avx512 avx2)
+endif()
+foreach(isa ${XTIER_ISAS})
   string(TOUPPER ${isa} ISA)
   add_library(xtier_engine_${isa} SHARED engine/engine.cpp)
   target_include_directories(xtier_engine_${isa} PRIVATE include)
@@ -31,7 +43,8 @@ foreach(isa avx512 avx2)
 endforeach()
 # cold/store.cpp: cold experts on NVMe (O_DIRECT reads into RAM slots), no ISA-specific code.
 add_library(xtier_engine SHARED engine/dispatch.cpp cold/store.cpp)
-add_dependencies(xtier_engine xtier_engine_avx512 xtier_engine_avx2)
+list(TRANSFORM XTIER_ISAS PREPEND "xtier_engine_" OUTPUT_VARIABLE XTIER_ISAS_TARGETS)
+add_dependencies(xtier_engine ${XTIER_ISAS_TARGETS})
 target_include_directories(xtier_engine PRIVATE include)
 target_compile_features(xtier_engine PRIVATE cxx_std_17)
 target_compile_options(xtier_engine PRIVATE -O2 -Wall -Wextra)

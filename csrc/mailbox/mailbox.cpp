@@ -6,10 +6,15 @@
 // Each slot must be used serially; destroy its graphs before closing the plan.
 #include <cuda_runtime_api.h>
 #include <cuda.h>
-#include <immintrin.h>
 #include <pthread.h>
 #include <sched.h>
 #include "xtier_engine.h"
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define XTIER_PAUSE() asm volatile("yield" ::: "memory")
+#else
+#include <immintrin.h>
+#define XTIER_PAUSE() _mm_pause()
+#endif
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -495,10 +500,10 @@ Dispatcher::Dispatcher() {
                     nanosleep(&nap,nullptr);continue;
                 }
             }
-            _mm_pause();
+            XTIER_PAUSE();
         }
     });
-    while(!ready.load(std::memory_order_acquire))_mm_pause();
+    while(!ready.load(std::memory_order_acquire))XTIER_PAUSE();
     if(ready.load()<0){worker.join();throw std::runtime_error("Dispatcher affinity rejected");}
     long timeout_s=60;
     if(const char *v=std::getenv("XTIER_CPU_TIMEOUT_S"))timeout_s=std::stol(v);
