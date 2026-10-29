@@ -148,3 +148,33 @@ python -m sglang.launch_server --model-path <ckpt> --tp-size 1 --mem-fraction-st
 - Run the server inside a cgroup so a runaway load cannot wedge the box (a wedge needs a power
   cycle): `systemd-run --user --scope -p MemoryHigh=104G -p MemoryMax=113G --swap-max 0`.
   MemoryHigh throttles, MemoryMax kills inside the scope; the rest of the machine stays up.
+
+### Tuning a single GB10
+
+DeepSeek-V4-Flash-0731 (43 layers x 256 experts, MXFP4), XTIER_FAST_LOAD=1, 16 workers, 3 rounds of
+3 x 256-token requests each, `steady` = the server's own `gen throughput` at the end of the run:
+
+| slots | cold | mem-frac | e2e tok/s | steady tok/s | note |
+|---|---|---|---|---|---|
+| 8  | 0.75 | 0.93 | 7.53 | 8.90 | starting point |
+| 32 | 0.70 | 0.93 | 8.82 | 10.34 | |
+| 48 | 0.70 | 0.93 | 9.51 | 11.58 | |
+| 48 | 0.62 | 0.93 | 10.64 | 12.03 | |
+| 56 | 0.62 | 0.93 | 10.48 | 12.32 | |
+| 48 | 0.58 | 0.90 | FAILED | - | "loaded weights leave no GPU memory for the KV cache" |
+| 48 | 0.58 | 0.93 | 10.52 | 12.14 | the same config passes once mem-frac rises |
+| **56** | **0.58** | **0.95** | **11.49** | **12.32** | 512-token bench, shipped as the default |
+| 64 | 0.62 | 0.97 | 10.01 | 12.28 | more slots stop helping |
+| 48 | 0.55 | 0.96 | 10.47 | 12.00 | less cold stops helping |
+
+What the sweep says:
+
+- GPU expert slots are monotone up to ~56; past that the extra copies cost more RAM than they save.
+- More RAM-resident experts (lower `XTIER_COLD_FRACTION`) is the bigger lever, but it raises the
+  weight footprint, and SGLang then refuses the KV cache: raise `--mem-fraction-static` with it
+  (0.90 -> 0.95). That trade is worth ~15 %.
+- 16 workers beats 18 (the mailbox dispatcher and the main thread need the cores); `XTIER_CACHE_EVERY=1`
+  does nothing.
+- The plateau is ~12.3-12.5 tok/s at 70 GB resident: the budget is no longer memory but the CPU
+  expert engine (a token needs ~26 GFLOP of routed-expert work, i.e. 27-33 tok/s at the measured
+  700-900 GF/s), so the next lever is speculative decoding (the checkpoint ships 3 MTP layers).
