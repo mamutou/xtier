@@ -120,3 +120,31 @@ prefill 三条路径）、每组都用 numpy 在 float64 里反量化同一份�
 5. **数值不是逐位相同**：x86 AVX512 用 `vdpbf16ps` 成对累加、AVX2 用加宽 FMA、NEON 用 `bfdot` 或加宽 FMA，
    三者的求和顺序都不同。`XTIER_DOWN_BF16=1` 时参考实现要和内核一样先把中间值舍入到 BF16，否则会有
    ~1e-3 的"假失败"（那是 BF16 的 2^-8，不是内核错）。
+
+## Single Spark (GB10) run
+
+One DGX Spark (GB10, 121 GB unified, 20 cores) cannot hold DeepSeek-V4-Flash (156 GB, 43 layers x
+256 experts, MXFP4) in memory, so a cold tier on NVMe is mandatory. Measured recipe:
+
+```bash
+export CUDA_HOME=/usr/local/cuda                 # the pip nvidia-cu13 wheel ships nvcc 13.3 with
+                                                 # mismatched cccl headers -> tilelang dies with
+                                                 # "CUDA compiler and CUDA toolkit headers are incompatible"
+export CPATH=$HOME/include/python3.12            # triton JITs driver.c; no system python3-dev here
+export PATH=$HOME/venvs/sglang-dspark/bin:$PATH  # triton shells out to ninja
+export TRITON_CACHE_DIR=$HOME/logs/triton-cache  # ~/.triton/cache is root-owned on the DGX image
+export XTIER=1 XTIER_THREADS=16 XTIER_FAST_LOAD=1 XTIER_CACHE_SLOTS=8 XTIER_COLD_FRACTION=0.75
+export XTIER_COLD_PATHS=$HOME/models/ds41-cold XTIER_DYNAMIC=2 XTIER_DOWN_BF16=1
+python -m sglang.launch_server --model-path <ckpt> --tp-size 1 --mem-fraction-static 0.93 \
+  --context-length 16384 --disable-shared-experts-fusion --cuda-graph-backend-prefill disabled
+```
+
+- `XTIER_THREADS` must leave CPUs free: the mailbox dispatcher needs one, and SGLang its own main
+  thread. 20 cores -> 16 workers (20 fails with "no CPU left for the mailbox dispatcher").
+- `XTIER_FAST_LOAD=1` is what makes it fit: experts stream straight into the engine, 2.2 GB/layer
+  instead of 3.8 GB/layer (43 layers: 97 GB instead of 163 GB).
+- `--mem-fraction-static` must be raised because the CPU engine's unified memory counts as used by
+  CUDA: at 0.55 SGLang refuses with "loaded weights leave no GPU memory for the KV cache".
+- Run the server inside a cgroup so a runaway load cannot wedge the box (a wedge needs a power
+  cycle): `systemd-run --user --scope -p MemoryHigh=104G -p MemoryMax=113G --swap-max 0`.
+  MemoryHigh throttles, MemoryMax kills inside the scope; the rest of the machine stays up.
