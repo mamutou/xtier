@@ -178,3 +178,30 @@ What the sweep says:
 - The plateau is ~12.3-12.5 tok/s at 70 GB resident: the budget is no longer memory but the CPU
   expert engine (a token needs ~26 GFLOP of routed-expert work, i.e. 27-33 tok/s at the measured
   700-900 GF/s), so the next lever is speculative decoding (the checkpoint ships 3 MTP layers).
+
+### Speculative decoding (DSPARK)
+
+The checkpoint bundles a DSpark head (`num_nextn_predict_layers=3`, `dspark_block_size=5`), and
+sglang 0.5.17 accepts `--speculative-algorithm DSPARK` for `DeepseekV4ForCausalLM`, so the plumbing is
+there. Two things have to be right before the first token:
+
+1. **Memory.** A single GB10 cannot hold the target and the draft at the default placement: the target
+   loaded at 107.75 GB left 6.09 GB, and the draft died. Drop the target to `slots=40 cold=0.66`
+   (87.56 GB), which leaves 26 GB, and the draft loads in 5.81 s at 6.09 GB.
+2. **`XTIER_DRAFT=1`.** XTier counts the draft's MoE layers and refuses them otherwise:
+   `RuntimeError: xtier: 3 draft MoE layers on XTier without XTIER_DRAFT=1`. With the flag the draft
+   runs its 3 layers on the CPU engine (GPU-only draft slots by default).
+
+After that the run stops in SGLang's sparse-MLA dispatch, not in XTier:
+
+```
+tvm.error.InternalError: Check failed: num_tokens > 64 (5 vs. 64) :
+Decode (num_tokens <= 64) must go through sparse_mla_sm120_decode_dsv3_2 or
+sparse_mla_sm120_decode_dsv4; got num_tokens=5
+```
+
+Reproduced with `--dsa-decode-backend` = flashinfer_sparse_mla, flashmla_sparse and tilelang, and
+with `--disable-cuda-graph` (then the token count changes from 10 to 5), so it is the draft forward
+calling the prefill-shaped kernel for a <= 64-token decode, not graph capture. The kernels it names
+exist; the selection does not pick them on sm_121. Until that dispatch is patched (or a newer SGLang
+is used), the single-Spark best is the non-speculative configuration above.
