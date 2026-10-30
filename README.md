@@ -137,6 +137,24 @@ XTier 加上跑起来必需的修正，不开提速项。配置、精度和原�
 
 SGLang 的 M3.1 分支（PR #45925），固定 512K，只跑 64K 会话；加速包对官方代码 + 必要修正每步 55.4 对 84.1 ms（快 34%）。
 
+## 单机 DGX Spark（ARM / aarch64）
+
+单台 DGX Spark（GB10，20 核 Armv8.6，121 GB 统一内存）跑 `DeepSeek-V4-Flash-0731`（156 GB，43 层 + 3 层 MTP）：
+CPU 专家引擎已移植到 NEON，专家放不下就留在统一内存或 NVMe 冷池。
+
+| 项目 | 实测 |
+|---|---|
+| 单流 decode（DSpark block=5，热身后） | **20.4** e2e / **30.0** steady tok/s |
+| 8 并发聚合 | 28.0 tok/s |
+| 冷 prefill（绕过前缀缓存） | **63–70 tok/s，与长度无关** |
+| decode @ 9K / 36K 上下文 | 16.0 / 17.1 tok/s |
+| KV 池 | 97.3 万 token（开投机）/ 400 万（关，可并行 3 个 1M） |
+| 对比双 Spark TP2（38.95 tok/s @ c1） | 单流为 **52%**，硬件只有一半 |
+
+**预填充是瓶颈**：900K 上下文的单个请求要约 3.7 小时——这台机器适合离线批处理（≤ 8K 提示），不适合长上下文交互。
+部署脚本见 [deploy/spark/](deploy/spark/)（含 cgroup 限内存启动器，防止整机 wedge），完整数据、取舍与复现命令见
+[单机报告](docs/reports/single-spark-gb10.md)，移植细节见 [ARM 移植](docs/arm-port.md)。
+
 ## 冷专家卸载到硬盘
 
 内存放不下全部专家时，每层只把一部分专家放内存，其余放到 NVMe 上的冷专家池，路由到时读回内存再算（`XTIER_COLD=1`，默认关，

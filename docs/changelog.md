@@ -2,6 +2,15 @@
 
 按日期倒序，README 只列最近 5 条。
 
+- 2026-10-30：单机 DGX Spark（GB10）部署与压测报告（[文档](reports/single-spark-gb10.md)）：ARM 专家引擎 + SGLang 0.5.21
+  + DSpark 在单台 121 GB 机器上跑 156 GB 的 DeepSeek-V4-Flash-0731。热身后单流 20.4 e2e / 30.0 steady tok/s，8 并发聚合
+  28.0 tok/s；单流是双 Spark TP2（38.95 tok/s @ c1）的 52%，而硬件只有一半。**预填充是墙**：绕过前缀缓存实测 63–70 tok/s
+  且与长度无关（900K 请求要约 3.7 小时），decode 在 9K/36K 上下文为 16.0/17.1 tok/s。KV 池开投机 97.3 万 token、关投机
+  400 万（3 个 1M 并发）。报告记录了四个坑：`XTIER_FAST_LOAD` 必须开（每层 3.8 GB→2.2 GB）、`mem-fraction` 必须 0.92+
+  、`systemd-run` 单元名必须唯一、**去掉 `--skip-server-warmup` 并发才能超过 2**（否则 `Prepare this stream/shape before
+  graph capture`）。新增 `deploy/spark/`（cgroup 限内存启动器，防整机 wedge）与 `bench/spark_decode.py` /
+  `bench/spark_lengths.py` / `bench/spark_concurrency.py` 三个基准；vision 因检查点缺 image 特殊 token 未接。
+
 - 2026-10-29：CPU 专家引擎移植到 AArch64（NEON）：`neonbf16` 构建用 Armv8.6 BF16 点积、`neon` 构建是任意 ARMv8-A 的
   加宽 FMA 版本，`libxtier_engine.so` 按 HWCAP2 自动选（`XTIER_ISA=neon|neonbf16` 可强制）；信箱的自旋提示改 `yield`，
   单 NUMA / 无 SMT 的机器不再套用 x86 的 4 节点拓扑。新验收脚本 `tests/neon_check.py`（合成层对 float64 参考，不需要检查点）
