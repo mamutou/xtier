@@ -244,3 +244,51 @@ $NEW/bin/python -c "import sglang.srt.entrypoints.http_server"   # repeat: insta
 Then launch with `PY=$NEW/bin/python` (the launcher honours `PY=`) and re-run the DSPARK and vision
 tests there. Note the working 0.5.17 stack must stay on torch 2.11 + sglang-kernel 0.4.5: 0.4.10 is
 built against torch 2.14 and fails with `undefined symbol: torch::Library::_def`.
+
+### DSPARK works on sglang 0.5.21
+
+0.5.21 is the release that fixes the sparse-MLA dispatch (it auto-tunes `sparse_mla_sm120_decode_dsv4`)
+and it also ships `deepseek_v41_vit.py`. Getting it running takes a hand-built venv: the resolver
+cannot solve it on aarch64 (plain PyPI `torch` is the CPU build), so the order matters -
+
+```bash
+python -m venv ~/venvs/sglang-521
+pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+pip install "flashinfer_python[cu13]==0.6.18" --extra-index-url https://flashinfer.ai/whl/cu130
+# torchvision from the same cu130 index, or AutoImageProcessor refuses to register and the
+# server dies with an ImportError whose message is the transformers backends complaint
+pip install --no-deps torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu130
+pip install --no-deps sglang==0.5.21 sglang-kernel==0.4.7
+# then copy the working venv's other 172 packages --no-deps and fill whatever import still names
+```
+
+Measured on one GB10, same XTier placement for every row (target `slots=40 cold=0.66` = 87.6 GB,
+draft 6.1 GB, `XTIER_DRAFT=1`, 512-token requests, 2x512 warmup discarded):
+
+| config | e2e tok/s | steady tok/s | accept len / rate |
+|---|---|---|---|
+| no speculative decoding (0.5.17) | 10.91 | 12.73 | - |
+| DSPARK block 7 | 11.08 | 16.31 | 3.62 / 0.38 |
+| DSPARK block 3 | 16.10 | 21.97 | 2.80 / 0.60 |
+| DSPARK block 5 (cold caches) | 17.28 | 21.85 | 2.70 / 0.34 |
+| **DSPARK block 5, warm (shipped)** | **20.41** | **29.95** | **4.50 / 0.70** |
+
+So speculative decoding is worth **+87% end to end and +135% steady** over the best non-speculative
+configuration, and the default block size of 5 is the right one - block 7 drafts tokens the model
+rejects, block 3 is close but consistently behind. The acceptance rate is the whole story: at 0.70
+each verify step yields 4.5 tokens, which is what turns 12.7 tok/s into 30.
+
+EAGLE is not a usable alternative for this checkpoint: with `--speculative-eagle-topk 1` and no
+`--speculative-num-steps` the hook asserts `speculative_eagle_topk is None`, and with explicit
+`--speculative-num-steps 3 --speculative-eagle-topk 1` it dies in XTier's EAGLE-path hooks
+(`qsa.sparse_attn.pack_qsa_prefill_kv`, `models.deepseek_v4_replay_tail`, `tilelang.backend.target`).
+The DSpark head bundled in this checkpoint is only driven by DSPARK.
+
+Launch line for the shipped configuration:
+
+```bash
+PY=$HOME/venvs/sglang-521/bin/python MEM=0.95 MEMCAP=118G MEMHIGH=110G \
+  XTIER_CACHE_SLOTS=40 XTIER_COLD_FRACTION=0.66 XTIER_THREADS=16 \
+  XTIER_FAST_LOAD=1 XTIER_DRAFT=1 \
+  bash ~/start_single_spark.sh --speculative-algorithm DSPARK
+```
