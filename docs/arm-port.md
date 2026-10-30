@@ -337,3 +337,46 @@ linear, because TP2 pays an interconnect round-trip inside every layer while one
 experts on its own CPU engine. Batching is where the second GB10 actually pays: the dual rig reaches
 ~90 tok/s at c8, and that is the gap to close once the CUDA-graph tiers for multi-request DSPARK are
 sorted out.
+
+### Batching, and what the KV pool actually is
+
+The `Prepare this stream/shape before graph capture` failure was **the bring-up launcher's own fault**:
+it passed `--skip-server-warmup`. Without the warmup pass, tilelang never prepares the shapes it is
+later asked to capture, and with `--max-running-requests` above 2 the capture set includes shapes that
+were never touched. Drop the flag (`WARM=1` in the launcher) and concurrency works - no graph-tier
+flag needed.
+
+Measured with 8 slots, 1M context, same placement (384-token requests, 2 rounds each):
+
+| threads | c1 | c4 | c8 |
+|---|---|---|---|
+| 16 | 14.9 | 25.7 | **28.0** |
+| 19 | 16.8 | - | 21.4 |
+
+More threads is *worse*: 19 workers on 20 cores starve the HTTP/scheduler threads, which is the same
+effect that made 18 threads lose to 16 in the single-stream sweep. Batching buys ~+88% aggregate over
+c1, and aggregate then plateaus at the CPU engine's throughput - the GPU has more to do, the ARM cores
+are now the wall.
+
+**KV pool** (fp8 KV, `--mem-fraction-static 0.95`, target 87.6 GB + draft 18.8 GB):
+
+| config | `max_total_num_tokens` | concurrent 1M requests |
+|---|---|---|
+| DSPARK on (shipped) | **973,056** | 0 - one 1M request does not fit, ~1 at 900K |
+| DSPARK off | **4,004,608** | 3 (4 at ~950K each) |
+
+That is the real cost of speculative decoding here: the 18.8 GB draft plus its KV turns a 4M-token
+pool into a 973K one. Pick per workload:
+
+```bash
+# speed (shipped): ~20-28 tok/s, ~950K context, 8 slots
+PY=$HOME/venvs/sglang-521/bin/python WARM=1 MAXREQ=8 CONTEXT=1048576 CTXPOOL=1048576 \
+  MEM=0.95 MEMCAP=118G MEMHIGH=110G XTIER_CACHE_SLOTS=40 XTIER_COLD_FRACTION=0.66 \
+  XTIER_THREADS=16 XTIER_FAST_LOAD=1 XTIER_DRAFT=1 \
+  bash ~/start_single_spark.sh --speculative-algorithm DSPARK
+
+# context: ~12.7 tok/s, 4M pool, three 1M requests at once
+PY=$HOME/venvs/sglang-521/bin/python WARM=1 MAXREQ=8 CONTEXT=1048576 CTXPOOL=4194304 \
+  MEM=0.95 MEMCAP=118G MEMHIGH=110G XTIER_CACHE_SLOTS=40 XTIER_COLD_FRACTION=0.66 \
+  XTIER_THREADS=16 XTIER_FAST_LOAD=1 bash ~/start_single_spark.sh
+```
