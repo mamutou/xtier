@@ -380,3 +380,40 @@ PY=$HOME/venvs/sglang-521/bin/python WARM=1 MAXREQ=8 CONTEXT=1048576 CTXPOOL=419
   MEM=0.95 MEMCAP=118G MEMHIGH=110G XTIER_CACHE_SLOTS=40 XTIER_COLD_FRACTION=0.66 \
   XTIER_THREADS=16 XTIER_FAST_LOAD=1 bash ~/start_single_spark.sh
 ```
+
+### Prefill is the wall
+
+Single-slot production layout (`MAXREQ=1 CONTEXT=921600 CTXPOOL=921600 MEM=0.95 BATCH=2048`,
+DSPARK on, 16 workers, pool 921,600 tokens), measured with a **unique first sentence per request**
+so sglang's radix cache cannot serve the prompt:
+
+| prompt | TTFT | prefill | decode |
+|---|---|---|---|
+| 9,082 tok | 143.9 s | **63 tok/s** | 16.0 tok/s |
+| 36,246 tok | 518.6 s | **70 tok/s** | 17.1 tok/s |
+
+Prefill is flat at 63-70 tok/s because it is arithmetic-bound on the CPU expert engine, not
+length-bound: every token needs the 43 layers x 6-of-256 experts to be computed on the ARM cores
+(~0.9 TFLOP/s measured at m=2048). Longer prompts buy nothing.
+
+Two traps when measuring this box:
+
+- **The radix cache makes prefill look 40x faster.** Repeating the same prompt text gave 2,502 tok/s
+  on a 9k prompt - that is a cache hit, not compute. Always salt the first tokens.
+- **The first request after startup is 7x slower** (38 vs 281 tok/s cold-vs-warm) because the hot
+  expert slots are empty and every expert read comes off the drive.
+
+Consequences for a 900K context, extrapolating at 70 tok/s:
+
+| context | prefill | verdict |
+|---|---|---|
+| 8K | ~2 min | batch jobs only |
+| 32K | ~8.5 min | batch jobs only |
+| 128K | ~30 min | not practical |
+| 900K | **~3.7 h** | single request costs half a day |
+
+So the 900K figure is a *capacity* number, not a usable operating point on one GB10: the pool holds
+921,600 tokens and `--max-running-requests 1` makes them all available to one request, but nothing
+can prefill that much. Keep `MEM=0.95` only if you actually intend to try; at that setting `free`
+reports **3-4 GB available**, which is what wedged the box on a 512K prefill. For a stable server use
+`MEM=0.92 CTXPOOL=700000` and treat ~32K as the practical ceiling.
