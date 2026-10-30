@@ -289,6 +289,9 @@ prefill (two nodes with TP2), where prefill is not computed on ARM cores.
 
 ## 8. Reproducing
 
+From a bare box, including the Python environment and the model caveat: `deploy/spark/REPRODUCE.md`.
+Quick version:
+
 ```bash
 # correctness, no GPU, no full checkpoint
 python tests/neon_check.py --threads 20

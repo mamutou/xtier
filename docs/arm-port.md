@@ -237,7 +237,7 @@ the remaining steps are:
 
 ```bash
 NEW=~/venvs/sglang-521
-$NEW/bin/pip install --no-deps pyzmq attrs transformers==5.19.0 tokenizers==0.23.2
+$NEW/bin/pip install --no-deps pyzmq attrs transformers tokenizers
 $NEW/bin/python -c "import sglang.srt.entrypoints.http_server"   # repeat: install whatever it names
 ```
 
@@ -261,6 +261,10 @@ pip install --no-deps torchvision==0.28.0 --index-url https://download.pytorch.o
 pip install --no-deps sglang==0.5.21 sglang-kernel==0.4.7
 # then copy the working venv's other 172 packages --no-deps and fill whatever import still names
 ```
+
+The exact resolved set (204 packages) is `deploy/spark/requirements-sglang-0.5.21.txt` - a `pip freeze`
+of the venv that produced every number in [the single-Spark report](reports/single-spark-gb10.md) - so
+you do not have to reconstruct it by hand.
 
 Measured on one GB10, same XTier placement for every row (target `slots=40 cold=0.66` = 87.6 GB,
 draft 6.1 GB, `XTIER_DRAFT=1`, 512-token requests, 2x512 warmup discarded):

@@ -15,6 +15,7 @@ PY=$HOME/venvs/sglang/bin/python MAXREQ=1 bash deploy/spark/start_cgroup.sh --sp
 ```
 
 Full measurements behind these defaults: [../../docs/reports/single-spark-gb10.md](../../docs/reports/single-spark-gb10.md).
+Reproducing from a bare box, including the Python environment: [REPRODUCE.md](REPRODUCE.md).
 
 ## Why the cgroup wrapper
 
