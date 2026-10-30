@@ -292,3 +292,48 @@ PY=$HOME/venvs/sglang-521/bin/python MEM=0.95 MEMCAP=118G MEMHIGH=110G \
   XTIER_FAST_LOAD=1 XTIER_DRAFT=1 \
   bash ~/start_single_spark.sh --speculative-algorithm DSPARK
 ```
+
+### Vision, the GPU and a dual-Spark comparison
+
+**Vision is blocked on the checkpoint, not on the port.** sglang 0.5.21 does have the tower
+(`models/deepseek_v41_vit.py`, and `deepseek_v4.py:4876` builds `ViT` + `Aligner` plus
+`image_start/end/newline`). The gate is:
+
+```python
+if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+```
+
+`DeepSeek-V4-Flash-Vision-Exp` has `vision_n_layers=32` but declares `model_type: deepseek_v4` and
+`vision_config: null`, so it is served as text-only ("Model only supports text input; received
+unsupported content type 'image_url'"). Setting `model_type: deepseek_v41` (the original is kept as
+`config.json.orig`) does activate the branch - and then it asks for `image_token_id`, which the
+checkpoint cannot answer: its tokenizer has **no image special tokens at all** (`added_tokens_decoder`
+has none, `special_tokens_map` has none, the chat template never mentions images). Guessing ids would
+map image patches to arbitrary embedding rows and produce confidently wrong answers, so the honest
+state is "waiting for a checkpoint that ships its tokenizer side".
+
+**The GPU is not a knob that can be turned up.** During 500-token single-stream generation:
+util 35-86% (mean ~64%), SM 2463-2476 MHz (already pinned at max), **power 30-36 W**, CPU 60% user /
+36% idle. Both sides idle *because they alternate*: one decode step is GPU (attention, dense) ->
+CPU (this layer's 6 of 256 experts, on the XTier engine) -> GPU (combine), and the GPU waits during
+the CPU half. The only way to fill it is more sequences in flight, and that is exactly what this stack
+cannot do yet: `--max-running-requests 8` or `16` dies in `RuntimeError: Prepare this stream/shape
+before graph capture` (the DSPARK verify shape has no captured CUDA-graph tier; neither
+`--speculative-dspark-align-verify-tokens-to-graph-tier` nor `--disable-cuda-graph` avoided it, and
+with `--cuda-graph-backend-decode disabled` plus 16 slots the server starts but concurrent requests
+stall). Treat ~64% / 31 tok/s as what an offloaded MoE looks like on a single GB10.
+
+**Single Spark vs dual Spark**, same model family, decode tok/s, concurrency 1/4/8:
+
+| rig | c1 | c4 | c8 | notes |
+|---|---|---|---|---|
+| single GB10, sglang 0.5.21 + XTier + DSPARK | **20.5-30.0** | - | - | this work, 512-token requests |
+| dual GB10 (vLLM TP2, RoCE), DSpark k=3 | 38.95 | 71.98 | 89.92 | same harness family |
+| dual GB10 (vLLM TP2), DSpark k=5 | 38.42 | 64.97 | 81.90 | |
+| dual GB10, V4.1-Flash EXL3 2.9bpw | 74.9 (prose) | 130 | - | different checkpoint/quant |
+
+Single-stream is **~52% of the dual-Spark number on half the hardware** - i.e. slightly better than
+linear, because TP2 pays an interconnect round-trip inside every layer while one node keeps all
+experts on its own CPU engine. Batching is where the second GB10 actually pays: the dual rig reaches
+~90 tok/s at c8, and that is the gap to close once the CUDA-graph tiers for multi-request DSPARK are
+sorted out.
