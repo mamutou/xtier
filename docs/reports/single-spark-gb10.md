@@ -9,6 +9,21 @@ Short version: **the port works, decode is ~52 % of a two-node TP2 deployment on
 and prefill is the wall** - 63-70 tok/s regardless of prompt length, which is what limits long-context
 use far more than memory does.
 
+## Abstract
+
+- The port works. One DGX Spark (GB10, 121 GB unified memory) serves a 156 GB `DeepSeek-V4-Flash-0731` - 43 layers plus
+  3 MTP layers - with every routed expert computed by the ported ARM NEON kernels.
+- **Decode: 20-31 tok/s** single-stream with DSPARK speculative decoding, and **28 tok/s aggregate at 8 concurrent**
+  requests.
+- That is **52 % of a two-node TP2 deployment (38.95 tok/s at c1) on half the hardware** - slightly better than linear,
+  because TP2 pays an interconnect round-trip inside every layer while one node keeps all experts on its own CPU engine.
+- **Prefill is the wall: 63-70 tok/s, flat in prompt length**, because it is arithmetic-bound on the CPU expert engine
+  (~0.9 TFLOP/s at m=2048) rather than length-bound. A 900K-token request therefore costs **~3.7 hours**.
+- Memory and context trade off hard: the KV pool holds **973K tokens with speculation and 4.0M without** (three
+  concurrent 1M requests), so the 18.8 GB draft is what decides how much context the box can hold.
+- **Recommended production configuration: one slot, 262K context, `mem-fraction 0.92`**, which leaves ~7 GB free. At 0.95
+  only 3-4 GB remain, and a long prefill then wedges the whole machine (observed twice; needs a power cycle).
+
 ## 中文摘要
 
 - 移植成功：单台 Spark（GB10，121 GB 统一内存）跑起 156 GB 的 `DeepSeek-V4-Flash-0731`，43 层 + 3 层投机的 MoE，全部经 XTier 的 ARM NEON 内核计算。
