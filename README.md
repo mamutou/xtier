@@ -1,4 +1,47 @@
-# XTier
+# XTier · arm-neon
+
+**本分支是 XTier 的 AArch64 移植版。** CPU 专家引擎从 AVX512/AVX2 移植到 NEON，在**一台** DGX Spark（GB10，20 核 Armv8.6，121 GB 统一内存）上跑起 156 GB 的 `DeepSeek-V4-Flash-0731`（43 层 + 3 层 MTP，256 专家，top-6，MXFP4）。
+
+| 单台 GB10 实测 | |
+|---|---|
+| 单流 decode（DSpark block=5，热身后） | **20.4** e2e / **30.0** steady tok/s |
+| 8 并发聚合 | 28.0 tok/s |
+| 冷 prefill（绕过前缀缓存） | **63–70 tok/s，与长度无关** |
+| decode @ 9K / 36K 上下文 | 16.0 / 17.1 tok/s |
+| 内核吞吐（真实检查点 512 行） | 889 GF/s（`neonbf16`）/ 343 GF/s（基线 NEON） |
+| KV 池 | 97.3 万 token（开投机）/ 400 万（关，可并行 3 个 1M） |
+| 对比双 Spark TP2（38.95 tok/s @ c1） | 单流 **52%**，硬件只有一半 |
+
+**两种 ARM 构建**：`neonbf16`（Armv8.6 BF16 点积 `vbfdotq_f32`）与 `neon`（任意 Armv8-A 的加宽 FMA 基线），运行时按 `AT_HWCAP2` 自动选，`XTIER_ISA=neon|neonbf16` 可强制。x86 的 AVX512/AVX2 路径原样保留，未改动。
+
+**30 秒自检（不需要 GPU、不需要检查点）**
+
+```bash
+XTIER_BUILD_JOBS=20 bash tools/build_engine.sh /usr/local/cuda
+python tests/neon_check.py --threads 20      # 期望 36/36 ok
+bash tools/isa_check.sh build                # 期望 ISA-CHECK PASS
+```
+
+**部署到一台 Spark**
+
+```bash
+PY=$HOME/venvs/sglang/bin/python bash deploy/spark/start_cgroup.sh --speculative-algorithm DSPARK
+```
+
+| 文档 | 内容 |
+|---|---|
+| [deploy/spark/](deploy/spark/) | 部署脚本（含 cgroup 限内存启动器，防整机 wedge）与变量表 |
+| [REPRODUCE.md](deploy/spark/REPRODUCE.md) | 从裸机复现清单、可对照数字与容差、症状→修法 |
+| [docs/reports/single-spark-gb10.md](docs/reports/single-spark-gb10.md) | 单机部署与压测报告（全部数据、取舍与结论） |
+| [docs/arm-port.md](docs/arm-port.md) | 移植设计与内核细节 |
+
+**已知边界**：预填充受 CPU 引擎算力限制（63–70 tok/s，与长度无关），900K 上下文的单个请求要约 3.7 小时——适合离线批处理（≤ 8K 提示），不适合长上下文交互。视觉塔未接通（检查点缺 image 特殊 token），EAGLE 在 SGLang 0.5.21 上不可用。SGLang 必须 **0.5.21**（0.5.17 的 sparse-MLA 分派会杀死 DSpark，0.5.22 需要 torch 2.14.1 而无 aarch64 cu130 轮子）。
+
+---
+
+## 上游 XTier（x86 主线）
+
+以下为上游项目的原始说明，来自 [a775828b-dot/xtier](https://github.com/a775828b-dot/xtier)（Apache-2.0）；本分支在其之上只增加了 ARM 移植与单机部署相关内容。
 
 **Cross-tier CPU/GPU hybrid MoE inference for [SGLang](https://github.com/sgl-project/sglang).**
 XTier is a plugin for upstream SGLang (tracking `main`): MoE experts live in GPU memory and host DRAM, are placed by how often
@@ -136,24 +179,6 @@ XTier 加上跑起来必需的修正，不开提速项。配置、精度和原�
 |  | 2 | 1,883 | 45.5 | 3.82 | 84.0 ms |
 
 SGLang 的 M3.1 分支（PR #45925），固定 512K，只跑 64K 会话；加速包对官方代码 + 必要修正每步 55.4 对 84.1 ms（快 34%）。
-
-## 单机 DGX Spark（ARM / aarch64）
-
-单台 DGX Spark（GB10，20 核 Armv8.6，121 GB 统一内存）跑 `DeepSeek-V4-Flash-0731`（156 GB，43 层 + 3 层 MTP）：
-CPU 专家引擎已移植到 NEON，专家放不下就留在统一内存或 NVMe 冷池。
-
-| 项目 | 实测 |
-|---|---|
-| 单流 decode（DSpark block=5，热身后） | **20.4** e2e / **30.0** steady tok/s |
-| 8 并发聚合 | 28.0 tok/s |
-| 冷 prefill（绕过前缀缓存） | **63–70 tok/s，与长度无关** |
-| decode @ 9K / 36K 上下文 | 16.0 / 17.1 tok/s |
-| KV 池 | 97.3 万 token（开投机）/ 400 万（关，可并行 3 个 1M） |
-| 对比双 Spark TP2（38.95 tok/s @ c1） | 单流为 **52%**，硬件只有一半 |
-
-**预填充是瓶颈**：900K 上下文的单个请求要约 3.7 小时——这台机器适合离线批处理（≤ 8K 提示），不适合长上下文交互。
-部署脚本见 [deploy/spark/](deploy/spark/)（含 cgroup 限内存启动器，防止整机 wedge），完整数据、取舍与复现命令见
-[单机报告](docs/reports/single-spark-gb10.md)，移植细节见 [ARM 移植](docs/arm-port.md)。
 
 ## 冷专家卸载到硬盘
 
